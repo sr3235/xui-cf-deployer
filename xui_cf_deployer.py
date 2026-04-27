@@ -3,6 +3,7 @@ import ipaddress
 import json
 import os
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -563,6 +564,133 @@ def save_last_links_snapshot(domain: str, user_uuid: str, links: Dict[str, str],
         exit_error(f"保存上次订阅失败: {e}")
 
 
+def extract_client_key(protocol: str) -> str:
+    if protocol == "trojan":
+        return "password"
+    return "id"
+
+
+def extract_uuid_from_settings(protocol: str, settings_text: str) -> str:
+    try:
+        payload = json.loads(settings_text or "{}")
+    except json.JSONDecodeError:
+        return ""
+    clients = payload.get("clients")
+    if not isinstance(clients, list) or not clients:
+        return ""
+    first = clients[0] if isinstance(clients[0], dict) else {}
+    key = extract_client_key(protocol)
+    value = str(first.get(key, "")).strip()
+    return value
+
+
+def extract_ws_path(stream_settings_text: str) -> str:
+    try:
+        payload = json.loads(stream_settings_text or "{}")
+    except json.JSONDecodeError:
+        return ""
+    ws = payload.get("wsSettings")
+    if not isinstance(ws, dict):
+        return ""
+    path = str(ws.get("path", "")).strip()
+    if not path.startswith("/"):
+        return ""
+    return path
+
+
+def extract_short_id(path: str, tag: str, remark: str) -> str:
+    path_match = re.match(r"^/([0-9a-f]{8})-(vl|tr|vm)$", path.strip().lower())
+    if path_match:
+        return path_match.group(1)
+
+    for text in (tag, remark):
+        m = re.match(r"^([0-9a-f]{8})-(vless|trojan|vmess)$", str(text).strip().lower())
+        if m:
+            return m.group(1)
+    return ""
+
+
+def load_legacy_routes_from_xui() -> Dict[str, Any]:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+    except sqlite3.Error as e:
+        exit_error(str(e))
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, protocol, settings, stream_settings, tag, remark, enable "
+            "FROM inbounds WHERE protocol IN ('vless','trojan','vmess') ORDER BY id DESC"
+        )
+        for item in cursor.fetchall():
+            protocol = str(item[1]).strip().lower()
+            if protocol not in PROTOCOL_ORDER:
+                continue
+            ws_path = extract_ws_path(str(item[3] or ""))
+            if not ws_path:
+                continue
+            short_id = extract_short_id(ws_path, str(item[4] or ""), str(item[5] or ""))
+            if not short_id:
+                continue
+            user_uuid = extract_uuid_from_settings(protocol, str(item[2] or ""))
+            if not user_uuid:
+                continue
+            rows.append(
+                {
+                    "id": int(item[0]),
+                    "protocol": protocol,
+                    "path": ws_path,
+                    "short_id": short_id,
+                    "uuid": user_uuid,
+                    "enable": int(item[6] or 0),
+                }
+            )
+    except sqlite3.Error as e:
+        exit_error(str(e))
+    finally:
+        conn.close()
+
+    if not rows:
+        return {}
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sid = row["short_id"]
+        bucket = grouped.setdefault(
+            sid,
+            {"max_id": 0, "uuid_votes": {}, "routes": {}, "enabled_count": 0},
+        )
+        bucket["max_id"] = max(bucket["max_id"], row["id"])
+        bucket["routes"][row["protocol"]] = {"protocol": row["protocol"], "path": row["path"], "port": 0}
+        bucket["uuid_votes"][row["uuid"]] = bucket["uuid_votes"].get(row["uuid"], 0) + 1
+        if row["enable"] == 1:
+            bucket["enabled_count"] += 1
+
+    best_sid = ""
+    best_score = (-1, -1, -1)
+    for sid, data in grouped.items():
+        score = (data["enabled_count"], len(data["routes"]), data["max_id"])
+        if score > best_score:
+            best_score = score
+            best_sid = sid
+
+    if not best_sid:
+        return {}
+
+    best = grouped[best_sid]
+    if not best["routes"]:
+        return {}
+    best_uuid = max(best["uuid_votes"].items(), key=lambda x: x[1])[0]
+    order = [p for p in PROTOCOL_ORDER if p in best["routes"]]
+    return {
+        "short_id": best_sid,
+        "uuid": best_uuid,
+        "routes": [best["routes"][p] for p in order],
+        "selected_protocols": order,
+    }
+
+
 def print_last_links() -> None:
     if os.path.exists(LAST_LINKS_PATH):
         try:
@@ -575,16 +703,42 @@ def print_last_links() -> None:
             return
 
     state = load_last_state()
-    if not state:
+    if state:
+        links = state.get("links")
+        if isinstance(links, dict):
+            order = state.get("selected_protocols") or PROTOCOL_ORDER
+            for protocol in order:
+                p = str(protocol).lower()
+                if p in links:
+                    print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+            return
+
+        # 兼容旧版本：state 里没有 links 时，使用 domain/uuid/routes 重新拼接
+        legacy_domain = str(state.get("domain", "")).strip()
+        legacy_uuid = str(state.get("uuid", "")).strip()
+        legacy_routes = state.get("routes")
+        if legacy_domain and legacy_uuid and isinstance(legacy_routes, list) and legacy_routes:
+            links = build_links(legacy_uuid, legacy_domain, legacy_routes)
+            order = state.get("selected_protocols") or [r.get("protocol") for r in legacy_routes]
+            order = [str(p).lower() for p in order if str(p).lower() in links]
+            save_last_links_snapshot(legacy_domain, legacy_uuid, links, order)
+            for protocol in order:
+                print(f"{PROTOCOL_LABEL.get(protocol, protocol.upper())}订阅 {links[protocol]}")
+            return
+
+    # 兼容更旧版本：无 state 信息，直接从 x-ui 数据库反推一套最新节点
+    recovered = load_legacy_routes_from_xui()
+    if not recovered:
         exit_error("未找到可查看的上次订阅")
-    links = state.get("links")
-    if not isinstance(links, dict):
-        exit_error("未找到可查看的上次订阅")
-    order = state.get("selected_protocols") or PROTOCOL_ORDER
+    domain = input("未找到缓存，请输入绑定域名用于旧版兼容拼接: ").strip()
+    if not domain:
+        exit_error("域名不能为空")
+    links = build_links(str(recovered["uuid"]), domain, recovered["routes"])
+    order = recovered["selected_protocols"]
+    save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
     for protocol in order:
-        p = str(protocol).lower()
-        if p in links:
-            print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+        if protocol in links:
+            print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
 
 
 def restore_dns_record(
