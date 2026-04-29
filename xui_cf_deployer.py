@@ -179,14 +179,18 @@ def set_ssl_mode(zone_id: str, headers: Dict[str, str], mode: str) -> None:
     )
 
 
-def build_origin_rules(routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_origin_rules(domain: str, routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rules = []
+    host = domain.strip().lower()
     for route in routes:
         rules.append(
             {
                 "description": f"{MANAGED_RULE_PREFIX}{route['protocol']} {route['path']}",
                 "enabled": True,
-                "expression": f'(http.request.uri.path eq "{route["path"]}")',
+                "expression": (
+                    f'(http.host eq "{host}" and '
+                    f'http.request.uri.path eq "{route["path"]}")'
+                ),
                 "action": "route",
                 "action_parameters": {"origin": {"port": route["port"]}},
             }
@@ -232,10 +236,10 @@ def put_origin_rules(zone_id: str, headers: Dict[str, str], rules: List[Dict[str
 
 
 def apply_origin_rules(
-    zone_id: str, headers: Dict[str, str], routes: List[Dict[str, Any]]
+    zone_id: str, headers: Dict[str, str], domain: str, routes: List[Dict[str, Any]]
 ) -> None:
     existing = get_origin_rules(zone_id, headers)
-    next_rules = strip_managed_origin_rules(existing) + build_origin_rules(routes)
+    next_rules = strip_managed_origin_rules(existing) + build_origin_rules(domain, routes)
     put_origin_rules(zone_id, headers, next_rules)
 
 
@@ -896,7 +900,7 @@ def main() -> None:
 
     managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
     set_ssl_mode(zone_id, headers, "flexible")
-    apply_origin_rules(zone_id, headers, routes)
+    apply_origin_rules(zone_id, headers, domain, routes)
 
     links = build_links(user_uuid, domain, routes)
     save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)

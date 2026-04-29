@@ -28,6 +28,7 @@
 - 脚本：`xui_cf_deployer.py`
 - 3x-ui 数据库：`/etc/x-ui/x-ui.db`
 - 状态记录：`/etc/x-ui/cf_auto_state.json`
+- 订阅快照：`cf_auto_last_links.txt`（保存在脚本运行目录）
 
 ## 运行命令
 
@@ -53,6 +54,7 @@ sudo ./xui_cf_deployer.py
 
 - `1`：安装（默认）
 - `2`：卸载
+- `3`：查看上次订阅
 
 ### 安装模式
 
@@ -72,6 +74,7 @@ sudo ./xui_cf_deployer.py
 - 设置 CF SSL 为 `flexible`
 - 下发/合并 Origin Rules（路径转发到对应端口）
 - 输出对应协议订阅链接
+- 将订阅结果保存到运行目录下的 `cf_auto_last_links.txt`
 
 ### 卸载模式
 
@@ -82,6 +85,15 @@ sudo ./xui_cf_deployer.py
 - 恢复 Cloudflare SSL 到安装前值
 - 恢复/删除该子域名 DNS 记录
 - 删除本地状态文件
+
+### 查看模式
+
+无需重装即可回看上次订阅：
+
+- 优先读取运行目录下的 `cf_auto_last_links.txt`
+- 若快照不存在，自动尝试旧版兼容重建：
+  - 先用旧状态文件中的 `domain/uuid/routes` 重新拼接
+  - 再兜底从 `x-ui` 现有 `inbounds` 反推一套节点并拼接
 
 ## 订阅链接参数
 
